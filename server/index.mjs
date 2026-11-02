@@ -57,6 +57,40 @@ function emaLast(values, period) {
   const alpha = 2 / (period + 1);
   return values.slice(1).reduce((prev, value) => prev + alpha * (value - prev), values[0]);
 }
+function buildForecast(closes, currentPrice, symbol, anchor) {
+  const returns = closes.slice(1).map((value, i) => Math.log(value / closes[i])).filter(Number.isFinite).slice(-252);
+  if (!(currentPrice > 0) || returns.length < 20) return null;
+  // Bootstrap complete observed daily returns rather than extrapolating one
+  // straight-line target. The seed makes a given quote snapshot reproducible.
+  let seed = [...`${symbol}:${anchor}`].reduce((hash, char) => (Math.imul(hash ^ char.charCodeAt(0), 16777619) >>> 0), 2166136261) || 1;
+  const random = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) / 4294967296; };
+  const pathCount = 600; const sessions = 252;
+  const paths = Array.from({ length: pathCount }, () => currentPrice);
+  const anchorDate = new Date(anchor || Date.now());
+  if (!Number.isFinite(anchorDate.getTime())) anchorDate.setTime(Date.now());
+  const points = [{ day: 0, date: anchorDate.toISOString(), p10: currentPrice, p50: currentPrice, p90: currentPrice, probabilityUp: 0.5 }];
+  for (let day = 1; day <= sessions; day += 1) {
+    const outcomes = [];
+    for (let path = 0; path < pathCount; path += 1) {
+      const sampledReturn = returns[Math.floor(random() * returns.length)];
+      paths[path] *= Math.exp(sampledReturn);
+      outcomes.push(paths[path]);
+    }
+    outcomes.sort((a, b) => a - b);
+    const date = new Date(anchorDate);
+    let added = 0;
+    while (added < day) {
+      date.setUTCDate(date.getUTCDate() + 1);
+      if (date.getUTCDay() !== 0 && date.getUTCDay() !== 6) added += 1;
+    }
+    points.push({
+      day, date: date.toISOString(), p10: Number(outcomes[Math.floor((pathCount - 1) * 0.1)].toFixed(4)),
+      p50: Number(outcomes[Math.floor((pathCount - 1) * 0.5)].toFixed(4)), p90: Number(outcomes[Math.floor((pathCount - 1) * 0.9)].toFixed(4)),
+      probabilityUp: outcomes.filter((price) => price > currentPrice).length / pathCount,
+    });
+  }
+  return { startPrice: currentPrice, anchor: anchorDate.toISOString(), sessionsUsed: returns.length, paths: pathCount, method: '600-path bootstrap of observed daily log returns; 10th–90th percentile range', points };
+}
 function calculate(closes, symbol, exchange, interval) {
   if (!closes.length) return {
     technicals: null,
@@ -69,10 +103,7 @@ function calculate(closes, symbol, exchange, interval) {
   const dailyVol = Math.sqrt(mean(returns.map((v) => (v - dailyDrift) ** 2)) ?? 0);
   const current = closes.at(-1);
   const periodsPerYear = { '5': 78 * 252, '30': 13 * 252, D: 252, W: 52, M: 12 }[interval] || 252;
-  const expected = current * Math.exp(dailyDrift * periodsPerYear);
   const annualVol = dailyVol * Math.sqrt(periodsPerYear);
-  const band = Math.min(5, Math.max(0.05, annualVol));
-  const target = Number(expected.toFixed(2));
   const change = current && closes.length > 1 ? ((current - closes.at(-2)) / closes.at(-2)) * 100 : null;
   const macd = emaLast(closes, 12) - emaLast(closes, 26);
   return {
@@ -81,7 +112,6 @@ function calculate(closes, symbol, exchange, interval) {
       macd, trend: closes.length > 1 ? (current > closes[0] ? 'Uptrend' : current < closes[0] ? 'Downtrend' : 'Flat') : 'Insufficient history',
       annualizedVolatility: annualVol * 100,
     },
-    scenarios: { base: target, low: Number((expected * Math.exp(-band)).toFixed(2)), high: Number((expected * Math.exp(band)).toFixed(2)), expectedReturnPct: current ? ((expected / current) - 1) * 100 : null, horizon: '12 months', method: 'Historical log-return drift with a one-standard-deviation volatility band' },
     changePctFromPrevious: change,
     instrument: { symbol, exchange: exchange || null },
   };
@@ -133,21 +163,26 @@ async function yahooCandles(symbol, range) {
     '1D': ['1d', '5m'], '1W': ['5d', '30m'], '1M': ['1mo', '1d'],
     '3M': ['3mo', '1d'], '1Y': ['1y', '1d'], ALL: ['max', '1mo'],
   }[range];
+  const controllers = [];
   let result = null;
-  let lastError = null;
-  for (const host of ['query1.finance.yahoo.com', 'query2.finance.yahoo.com']) {
+  try {
+    result = await Promise.any(['query1.finance.yahoo.com', 'query2.finance.yahoo.com'].map(async (host) => {
+      const controller = new AbortController(); controllers.push(controller);
     const url = new URL(`https://${host}/v8/finance/chart/${encodeURIComponent(ticker)}`);
     url.searchParams.set('range', query[0]);
     url.searchParams.set('interval', query[1]);
-    try {
-      const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 MarketLens/1.0' }, signal: AbortSignal.timeout(15_000) });
+      const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 MarketLens/1.0' }, signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) });
       const body = await response.json().catch(() => ({}));
-      result = body.chart?.result?.[0];
-      if (!response.ok || !result) throw new Error(body.chart?.error?.description || `Historical candles unavailable (${response.status}).`);
-      break;
-    } catch (error) { lastError = error; }
+      const row = body.chart?.result?.[0];
+      if (!response.ok || !row) throw new Error(body.chart?.error?.description || `Historical candles unavailable (${response.status}).`);
+      return row;
+    }));
+  } catch (error) {
+    const lastError = error.errors?.at(-1) || error;
+    throw lastError || new Error('Historical candles are unavailable.');
+  } finally {
+    for (const controller of controllers) controller.abort();
   }
-  if (!result) throw lastError || new Error('Historical candles are unavailable.');
   const quote = result.indicators?.quote?.[0] || {};
   const values = (result.timestamp || []).map((timestamp, i) => ({
     datetime: new Date(timestamp * 1000).toISOString(), open: quote.open?.[i], high: quote.high?.[i],
@@ -173,8 +208,9 @@ async function market(url) {
   const { symbol, exchange } = paramsFrom(url);
   const name = (url.searchParams.get('name') || '').trim().slice(0, 120);
   const range = ['1D', '1W', '1M', '3M', '1Y', 'ALL'].includes(url.searchParams.get('range')) ? url.searchParams.get('range') : '1M';
-  const key = `market:finnhub:${symbol}:${range}`;
-  return cached(key, async () => {
+  // Quotes are intentionally fetched on every request. Historical search/news
+  // can use short caches, but a market refresh must never replay a saved quote.
+  return (async () => {
     const now = Math.floor(Date.now() / 1000);
     const windows = { '1D': 2 * 86400, '1W': 7 * 86400, '1M': 31 * 86400, '3M': 92 * 86400, '1Y': 366 * 86400, 'ALL': 10 * 365 * 86400 };
     const resolutions = { '1D': '5', '1W': '30', '1M': 'D', '3M': 'D', '1Y': 'D', 'ALL': 'M' };
@@ -223,6 +259,7 @@ async function market(url) {
     const previous = chart.at(-2);
     const hasFinnhubQuote = number(quote?.c) > 0;
     const quotePrice = hasFinnhubQuote ? number(quote.c) : number(yahooMeta?.regularMarketPrice) ?? latest?.close ?? null;
+    const quoteDate = hasFinnhubQuote && quote?.t ? new Date(quote.t * 1000).toISOString() : yahooMeta?.regularMarketTime ? new Date(yahooMeta.regularMarketTime * 1000).toISOString() : latest?.date || new Date().toISOString();
     const numeric = (field, fallback = null) => number(quote?.[field]) || fallback;
     return {
       symbol, exchange: profile?.exchange || exchange || null,
@@ -238,13 +275,13 @@ async function market(url) {
       source: hasFinnhubQuote ? 'Finnhub' : 'Yahoo Finance', quoteSource: hasFinnhubQuote ? 'Finnhub' : 'Yahoo Finance', historySource,
       fetchedAt: new Date().toISOString(), stale: false,
     };
-  });
+  })();
 }
 async function handle(req, res) {
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   try {
-    if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { ok: true, provider: 'Finnhub', configured: Boolean(getApiKey()), cacheSeconds: CACHE_MS / 1000 });
+    if (req.method === 'GET' && url.pathname === '/api/health') return json(res, 200, { ok: true, provider: 'Finnhub', configured: Boolean(getApiKey()), marketCacheSeconds: 0, searchCacheSeconds: CACHE_MS / 1000 });
     if (req.method !== 'GET') return json(res, 405, { error: 'Only GET requests are supported.' });
     if (url.pathname === '/api/search') {
       const q = (url.searchParams.get('q') || '').trim();
@@ -263,6 +300,17 @@ async function handle(req, res) {
       }
       if (!merged.size && finnhubResult.status === 'rejected' && yahooResult.status === 'rejected') throw finnhubResult.reason;
       return json(res, 200, { results: [...merged.values()] });
+    }
+    if (url.pathname === '/api/forecast') {
+      const { symbol } = paramsFrom(url);
+      const price = number(url.searchParams.get('price'));
+      const anchor = (url.searchParams.get('anchor') || '').slice(0, 40);
+      if (!(price > 0)) { const error = new Error('A current provider price is required to build the forecast.'); error.status = 400; throw error; }
+      const history = await yahooCandles(symbol, '1Y');
+      const closes = history.values.map((row) => number(row.close)).filter((value) => value > 0);
+      const forecast = buildForecast(closes, price, symbol, anchor || new Date().toISOString());
+      if (!forecast) { const error = new Error('At least 20 daily price changes are required for a forecast.'); error.status = 422; throw error; }
+      return json(res, 200, { symbol, forecast, forecastSource: 'Yahoo Finance daily history' });
     }
     if (url.pathname === '/api/market') return json(res, 200, await market(url));
     if (url.pathname === '/api/stocks') {
